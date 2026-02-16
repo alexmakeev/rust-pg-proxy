@@ -1,4 +1,4 @@
-use sqlparser::ast::{SetExpr, Statement};
+use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
@@ -11,11 +11,6 @@ pub enum QueryClassification {
 
 /// Classifies a SQL query as read-only, cache-reset, or blocked
 pub fn classify_query(sql: &str) -> QueryClassification {
-    // Check for cache reset function (case-insensitive)
-    if sql.to_lowercase().contains("rustproxy_cache_reset()") {
-        return QueryClassification::CacheReset;
-    }
-
     // Handle empty or whitespace-only queries
     if sql.trim().is_empty() {
         return QueryClassification::ReadOnly;
@@ -51,10 +46,21 @@ pub fn classify_query(sql: &str) -> QueryClassification {
 /// Classifies a single parsed statement
 fn classify_statement(statement: &Statement) -> QueryClassification {
     match statement {
-        // SELECT statements - check for INTO and FOR UPDATE/SHARE
+        // SELECT statements - check for cache reset function, INTO, and FOR UPDATE/SHARE
         Statement::Query(query) => {
-            // Check for SELECT INTO
+            // Check for cache reset function
             if let SetExpr::Select(select) = query.body.as_ref() {
+                // Check for rustproxy_cache_reset() function call
+                if select.projection.len() == 1 {
+                    if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
+                        let func_name = func.name.to_string().to_lowercase();
+                        if func_name == "rustproxy_cache_reset" {
+                            return QueryClassification::CacheReset;
+                        }
+                    }
+                }
+
+                // Check for SELECT INTO
                 if select.into.is_some() {
                     return QueryClassification::Blocked("SELECT INTO is not allowed".to_string());
                 }
@@ -70,13 +76,21 @@ fn classify_statement(statement: &Statement) -> QueryClassification {
             QueryClassification::ReadOnly
         }
 
-        // Transaction control - allowed
-        Statement::StartTransaction { .. } => QueryClassification::ReadOnly,
-        Statement::Commit { .. } => QueryClassification::ReadOnly,
-        Statement::Rollback { .. } => QueryClassification::ReadOnly,
+        // Transaction control - BLOCKED (no session affinity, meaningless in proxy)
+        Statement::StartTransaction { .. } => QueryClassification::Blocked(
+            "Transactions are not supported in proxy mode".to_string(),
+        ),
+        Statement::Commit { .. } => QueryClassification::Blocked(
+            "Transactions are not supported in proxy mode".to_string(),
+        ),
+        Statement::Rollback { .. } => QueryClassification::Blocked(
+            "Transactions are not supported in proxy mode".to_string(),
+        ),
 
-        // SET commands - allowed (all variants of Set enum)
-        Statement::Set(_) => QueryClassification::ReadOnly,
+        // SET commands - BLOCKED (session state leaks between pooled connections)
+        Statement::Set(_) => QueryClassification::Blocked(
+            "SET is not supported in proxy mode".to_string(),
+        ),
 
         // SHOW commands - allowed
         Statement::ShowVariable { .. } => QueryClassification::ReadOnly,
@@ -301,9 +315,9 @@ mod tests {
     }
 
     #[test]
-    fn test_set_allowed() {
+    fn test_set_blocked() {
         let result = classify_query("SET search_path TO public");
-        assert_eq!(result, QueryClassification::ReadOnly);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
     }
 
     #[test]
@@ -313,21 +327,21 @@ mod tests {
     }
 
     #[test]
-    fn test_begin_allowed() {
+    fn test_begin_blocked() {
         let result = classify_query("BEGIN");
-        assert_eq!(result, QueryClassification::ReadOnly);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
     }
 
     #[test]
-    fn test_commit_allowed() {
+    fn test_commit_blocked() {
         let result = classify_query("COMMIT");
-        assert_eq!(result, QueryClassification::ReadOnly);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
     }
 
     #[test]
-    fn test_rollback_allowed() {
+    fn test_rollback_blocked() {
         let result = classify_query("ROLLBACK");
-        assert_eq!(result, QueryClassification::ReadOnly);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
     }
 
     #[test]
@@ -340,6 +354,13 @@ mod tests {
     fn test_cache_reset_case_insensitive() {
         let result = classify_query("SELECT RUSTPROXY_CACHE_RESET()");
         assert_eq!(result, QueryClassification::CacheReset);
+    }
+
+    #[test]
+    fn test_cache_reset_not_triggered_by_string_literal() {
+        // String literal should not trigger cache reset
+        let result = classify_query("SELECT 'rustproxy_cache_reset()'");
+        assert_eq!(result, QueryClassification::ReadOnly);
     }
 
     #[test]

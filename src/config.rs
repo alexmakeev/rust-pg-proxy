@@ -16,8 +16,6 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        dotenvy::dotenv().ok();
-
         let upstream_host = env::var("UPSTREAM_HOST")
             .map_err(|_| "UPSTREAM_HOST is required".to_string())?;
 
@@ -57,6 +55,14 @@ impl Config {
             .unwrap_or_else(|_| "5".to_string())
             .parse::<usize>()
             .map_err(|_| "POOL_SIZE must be a valid number".to_string())?;
+
+        // Validate configuration values
+        if pool_size == 0 {
+            return Err("POOL_SIZE must be greater than 0".to_string());
+        }
+        if cache_ttl_seconds == 0 {
+            return Err("CACHE_TTL_SECONDS must be greater than 0".to_string());
+        }
 
         Ok(Config {
             upstream_host,

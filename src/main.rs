@@ -46,6 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls),
     )
     .max_size(config.pool_size)
+    .wait_timeout(Some(std::time::Duration::from_secs(5)))
+    .create_timeout(Some(std::time::Duration::from_secs(5)))
+    .recycle_timeout(Some(std::time::Duration::from_secs(5)))
     .build()
     .map_err(|e| {
         error!("Failed to create connection pool: {}", e);
@@ -88,17 +91,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup graceful shutdown signal handling
     let shutdown_signal = async {
         let ctrl_c = async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
+            match signal::ctrl_c().await {
+                Ok(_) => {},
+                Err(e) => {
+                    error!("Failed to install Ctrl+C handler: {}", e);
+                }
+            }
         };
 
         #[cfg(unix)]
         let terminate = async {
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut stream) => {
+                    stream.recv().await;
+                }
+                Err(e) => {
+                    error!("Failed to install SIGTERM handler: {}", e);
+                }
+            }
         };
 
         #[cfg(not(unix))]

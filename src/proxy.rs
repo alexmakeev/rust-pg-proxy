@@ -13,7 +13,29 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::fmt::Debug;
 use std::sync::Arc;
-use tokio_postgres::types::Type as PgType;
+use tokio::time::{timeout, Duration};
+
+/// Convert a PostgreSQL type OID to pgwire Type
+fn oid_to_pgwire_type(oid: u32) -> Type {
+    match oid {
+        16 => Type::BOOL,
+        21 => Type::INT2,
+        23 => Type::INT4,
+        20 => Type::INT8,
+        700 => Type::FLOAT4,
+        701 => Type::FLOAT8,
+        1043 | 25 => Type::VARCHAR,
+        17 => Type::BYTEA,
+        1114 => Type::TIMESTAMP,
+        1184 => Type::TIMESTAMPTZ,
+        1082 => Type::DATE,
+        1083 => Type::TIME,
+        114 | 3802 => Type::JSON,
+        2950 => Type::UUID,
+        1700 => Type::NUMERIC,  // ADD: NUMERIC/DECIMAL support
+        _ => Type::VARCHAR, // Default fallback
+    }
+}
 
 pub struct ReadOnlyProxy {
     pool: deadpool_postgres::Pool,
@@ -23,27 +45,6 @@ pub struct ReadOnlyProxy {
 impl ReadOnlyProxy {
     pub fn new(pool: deadpool_postgres::Pool, cache: Arc<QueryCache>) -> Self {
         Self { pool, cache }
-    }
-
-    /// Convert tokio-postgres Type OID to pgwire Type
-    fn pg_type_to_pgwire_type(pg_type: &PgType) -> Type {
-        match *pg_type {
-            PgType::BOOL => Type::BOOL,
-            PgType::INT2 => Type::INT2,
-            PgType::INT4 => Type::INT4,
-            PgType::INT8 => Type::INT8,
-            PgType::FLOAT4 => Type::FLOAT4,
-            PgType::FLOAT8 => Type::FLOAT8,
-            PgType::VARCHAR | PgType::TEXT => Type::VARCHAR,
-            PgType::BYTEA => Type::BYTEA,
-            PgType::TIMESTAMP => Type::TIMESTAMP,
-            PgType::TIMESTAMPTZ => Type::TIMESTAMPTZ,
-            PgType::DATE => Type::DATE,
-            PgType::TIME => Type::TIME,
-            PgType::JSON | PgType::JSONB => Type::JSON,
-            PgType::UUID => Type::UUID,
-            _ => Type::VARCHAR, // Default fallback for unknown types
-        }
     }
 }
 
@@ -99,24 +100,7 @@ impl SimpleQueryHandler for ReadOnlyProxy {
                         .columns
                         .iter()
                         .map(|col| {
-                            // Map OID back to pgwire Type
-                            let pg_type = match col.type_oid {
-                                16 => Type::BOOL,
-                                21 => Type::INT2,
-                                23 => Type::INT4,
-                                20 => Type::INT8,
-                                700 => Type::FLOAT4,
-                                701 => Type::FLOAT8,
-                                1043 | 25 => Type::VARCHAR,
-                                17 => Type::BYTEA,
-                                1114 => Type::TIMESTAMP,
-                                1184 => Type::TIMESTAMPTZ,
-                                1082 => Type::DATE,
-                                1083 => Type::TIME,
-                                114 | 3802 => Type::JSON,
-                                2950 => Type::UUID,
-                                _ => Type::VARCHAR,
-                            };
+                            let pg_type = oid_to_pgwire_type(col.type_oid);
                             FieldInfo::new(col.name.clone(), None, None, pg_type, FieldFormat::Text)
                         })
                         .collect();
@@ -155,13 +139,28 @@ impl SimpleQueryHandler for ReadOnlyProxy {
                     )))
                 })?;
 
-                let rows = pg_client.query(query, &[]).await.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_owned(),
-                        "42000".to_owned(),
-                        format!("Query execution failed: {}", e),
-                    )))
-                })?;
+                let query_timeout = Duration::from_secs(30); // 30 second query timeout
+                let rows = timeout(query_timeout, pg_client.query(query, &[]))
+                    .await
+                    .map_err(|_| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "57014".to_owned(), // query_canceled
+                            "Query execution timed out (30s limit)".to_owned(),
+                        )))
+                    })?
+                    .map_err(|e| {
+                        let code = if let Some(db_err) = e.as_db_error() {
+                            db_err.code().code().to_string()
+                        } else {
+                            "08006".to_string() // connection_failure
+                        };
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            code,
+                            format!("Query execution failed: {}", e),
+                        )))
+                    })?;
 
                 // Extract column information
                 let columns: Vec<_> = if !rows.is_empty() {
@@ -171,7 +170,7 @@ impl SimpleQueryHandler for ReadOnlyProxy {
                         .map(|col| {
                             let pg_type = col.type_();
                             let type_oid = pg_type.oid();
-                            let pgwire_type = Self::pg_type_to_pgwire_type(pg_type);
+                            let pgwire_type = oid_to_pgwire_type(type_oid);
                             (col.name().to_owned(), type_oid, pgwire_type)
                         })
                         .collect()
@@ -198,20 +197,35 @@ impl SimpleQueryHandler for ReadOnlyProxy {
                     let mut row_strings = Vec::new();
                     let mut encoder = DataRowEncoder::new(fields_arc.clone());
 
-                    for (i, (_name, _oid, _pgwire_type)) in columns.iter().enumerate() {
-                        // Try to get value as string for caching
-                        let value_str: Option<String> = if row.try_get::<_, String>(i).is_ok() {
-                            row.try_get(i).ok()
-                        } else if let Some(v) = row.try_get::<_, Option<i32>>(i).ok().flatten() {
-                            Some(v.to_string())
-                        } else if let Some(v) = row.try_get::<_, Option<i64>>(i).ok().flatten() {
-                            Some(v.to_string())
-                        } else if let Some(v) = row.try_get::<_, Option<f64>>(i).ok().flatten() {
-                            Some(v.to_string())
-                        } else if let Some(v) = row.try_get::<_, Option<bool>>(i).ok().flatten() {
-                            Some(v.to_string())
-                        } else {
-                            None
+                    for (i, (_name, type_oid, _pgwire_type)) in columns.iter().enumerate() {
+                        // Use the column type OID to guide extraction
+                        let value_str: Option<String> = match type_oid {
+                            // String types
+                            25 | 1043 | 19 | 18 | 1042 => row.try_get::<_, Option<String>>(i).ok().flatten(),
+                            // Int types
+                            21 => row.try_get::<_, Option<i16>>(i).ok().flatten().map(|v| v.to_string()),
+                            23 => row.try_get::<_, Option<i32>>(i).ok().flatten().map(|v| v.to_string()),
+                            20 => row.try_get::<_, Option<i64>>(i).ok().flatten().map(|v| v.to_string()),
+                            // Float types
+                            700 => row.try_get::<_, Option<f32>>(i).ok().flatten().map(|v| v.to_string()),
+                            701 => row.try_get::<_, Option<f64>>(i).ok().flatten().map(|v| v.to_string()),
+                            // Boolean
+                            16 => row.try_get::<_, Option<bool>>(i).ok().flatten().map(|v| v.to_string()),
+                            // Fallback: try String first, then try common types
+                            _ => {
+                                if let Ok(Some(v)) = row.try_get::<_, Option<String>>(i) {
+                                    Some(v)
+                                } else if let Ok(Some(v)) = row.try_get::<_, Option<i64>>(i) {
+                                    Some(v.to_string())
+                                } else if let Ok(Some(v)) = row.try_get::<_, Option<f64>>(i) {
+                                    Some(v.to_string())
+                                } else if let Ok(Some(v)) = row.try_get::<_, Option<bool>>(i) {
+                                    Some(v.to_string())
+                                } else {
+                                    // Check if column is actually NULL
+                                    None
+                                }
+                            }
                         };
 
                         // Encode for response
