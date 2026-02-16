@@ -1,0 +1,8 @@
+/target
+.env
+PLAN.md
+materials/
+sandboxes/
+*.swp
+*.swo
+.DS_Store

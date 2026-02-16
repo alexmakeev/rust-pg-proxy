@@ -1,0 +1,19 @@
+[package]
+name = "rust-pg-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pgwire = "0.25"
+sqlparser = { version = "0.59", features = ["visitor"] }
+moka = { version = "0.12", features = ["future"] }
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = "0.14"
+twox-hash = "2.0"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+async-trait = "0.1"
+futures-util = { version = "0.3.32", features = ["sink"] }

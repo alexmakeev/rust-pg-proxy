@@ -1,0 +1,26 @@
+version: "3.8"
+services:
+  rust-pg-proxy:
+    build: .
+    container_name: rust-pg-proxy
+    restart: unless-stopped
+    ports:
+      - "5433:5433"
+    environment:
+      - UPSTREAM_HOST=${UPSTREAM_HOST}
+      - UPSTREAM_PORT=${UPSTREAM_PORT:-5432}
+      - UPSTREAM_USER=${UPSTREAM_USER}
+      - UPSTREAM_PASSWORD=${UPSTREAM_PASSWORD}
+      - UPSTREAM_DATABASE=${UPSTREAM_DATABASE}
+      - LISTEN_HOST=0.0.0.0
+      - LISTEN_PORT=5433
+      - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-900}
+      - MAX_CACHE_ENTRIES=${MAX_CACHE_ENTRIES:-10000}
+      - POOL_SIZE=${POOL_SIZE:-5}
+      - RUST_LOG=info
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
