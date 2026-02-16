@@ -1,6 +1,7 @@
 use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
+use std::ops::Deref;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryClassification {
@@ -48,6 +49,32 @@ fn classify_statement(statement: &Statement) -> QueryClassification {
     match statement {
         // SELECT statements - check for cache reset function, INTO, and FOR UPDATE/SHARE
         Statement::Query(query) => {
+            // CRITICAL SECURITY CHECK: CTEs can contain DML operations
+            // Example: WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted
+            if let Some(with) = &query.with {
+                for cte in &with.cte_tables {
+                    // Check if CTE body contains DML operations
+                    match cte.query.body.deref() {
+                        SetExpr::Insert(_) => {
+                            return QueryClassification::Blocked(
+                                "INSERT in CTE is not allowed".to_string()
+                            );
+                        }
+                        SetExpr::Update(_) => {
+                            return QueryClassification::Blocked(
+                                "UPDATE in CTE is not allowed".to_string()
+                            );
+                        }
+                        SetExpr::Delete(_) => {
+                            return QueryClassification::Blocked(
+                                "DELETE in CTE is not allowed".to_string()
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // Check for cache reset function
             if let SetExpr::Select(select) = query.body.as_ref() {
                 // Check for rustproxy_cache_reset() function call
@@ -99,8 +126,22 @@ fn classify_statement(statement: &Statement) -> QueryClassification {
         Statement::ShowTables { .. } => QueryClassification::ReadOnly,
         Statement::ShowCollation { .. } => QueryClassification::ReadOnly,
 
-        // EXPLAIN - allowed
-        Statement::Explain { .. } => QueryClassification::ReadOnly,
+        // EXPLAIN - CRITICAL SECURITY CHECK
+        // EXPLAIN without ANALYZE is safe (just shows plan, doesn't execute)
+        // EXPLAIN ANALYZE actually EXECUTES the statement - must check if inner statement is safe
+        Statement::Explain { analyze, statement, .. } => {
+            if *analyze {
+                // EXPLAIN ANALYZE executes the statement - recursively classify it
+                let inner_classification = classify_statement(statement);
+                if let QueryClassification::Blocked(reason) = inner_classification {
+                    return QueryClassification::Blocked(
+                        format!("EXPLAIN ANALYZE with blocked operation: {}", reason)
+                    );
+                }
+            }
+            // Plain EXPLAIN (without ANALYZE) or EXPLAIN ANALYZE with safe statement
+            QueryClassification::ReadOnly
+        }
         Statement::ExplainTable { .. } => QueryClassification::ReadOnly,
 
         // Write operations - blocked
@@ -458,5 +499,105 @@ mod tests {
     fn test_copy_blocked() {
         let result = classify_query("COPY users TO '/tmp/users.csv'");
         assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    // CRITICAL SECURITY TESTS: CTE with DML operations
+    #[test]
+    fn test_cte_with_delete_blocked() {
+        let result = classify_query("WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_cte_with_insert_blocked() {
+        let result = classify_query("WITH inserted AS (INSERT INTO users (name) VALUES ('test') RETURNING *) SELECT * FROM inserted");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_cte_with_update_blocked() {
+        let result = classify_query("WITH updated AS (UPDATE users SET name = 'test' RETURNING *) SELECT * FROM updated");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_cte_with_select_allowed() {
+        let result = classify_query("WITH cte AS (SELECT 1) SELECT * FROM cte");
+        assert_eq!(result, QueryClassification::ReadOnly);
+    }
+
+    // CRITICAL SECURITY TESTS: EXPLAIN ANALYZE bypass
+    #[test]
+    fn test_explain_analyze_insert_blocked() {
+        let result = classify_query("EXPLAIN ANALYZE INSERT INTO users (name) VALUES ('test')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_explain_analyze_update_blocked() {
+        let result = classify_query("EXPLAIN ANALYZE UPDATE users SET name = 'test'");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_explain_analyze_delete_blocked() {
+        let result = classify_query("EXPLAIN ANALYZE DELETE FROM users");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_explain_analyze_select_allowed() {
+        let result = classify_query("EXPLAIN ANALYZE SELECT * FROM users");
+        assert_eq!(result, QueryClassification::ReadOnly);
+    }
+
+    #[test]
+    fn test_explain_without_analyze_allowed() {
+        // Plain EXPLAIN doesn't execute, just shows plan - safe even for writes
+        let result = classify_query("EXPLAIN INSERT INTO users (name) VALUES ('test')");
+        assert_eq!(result, QueryClassification::ReadOnly);
+    }
+
+    #[test]
+    fn test_security_fixes_manual_verification() {
+        // Manual verification test with output
+        println!("\n=== SECURITY VULNERABILITY FIXES ===\n");
+
+        println!("1. CTE with DELETE (BLOCKED):");
+        let result = classify_query("WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted");
+        println!("   {:?}\n", result);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+
+        println!("2. CTE with INSERT (BLOCKED):");
+        let result = classify_query("WITH inserted AS (INSERT INTO users (name) VALUES ('test') RETURNING *) SELECT * FROM inserted");
+        println!("   {:?}\n", result);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+
+        println!("3. CTE with UPDATE (BLOCKED):");
+        let result = classify_query("WITH updated AS (UPDATE users SET name = 'test' RETURNING *) SELECT * FROM updated");
+        println!("   {:?}\n", result);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+
+        println!("4. CTE with SELECT (ALLOWED):");
+        let result = classify_query("WITH cte AS (SELECT 1) SELECT * FROM cte");
+        println!("   {:?}\n", result);
+        assert_eq!(result, QueryClassification::ReadOnly);
+
+        println!("5. EXPLAIN ANALYZE INSERT (BLOCKED):");
+        let result = classify_query("EXPLAIN ANALYZE INSERT INTO users (name) VALUES ('test')");
+        println!("   {:?}\n", result);
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+
+        println!("6. EXPLAIN ANALYZE SELECT (ALLOWED):");
+        let result = classify_query("EXPLAIN ANALYZE SELECT * FROM users");
+        println!("   {:?}\n", result);
+        assert_eq!(result, QueryClassification::ReadOnly);
+
+        println!("7. EXPLAIN INSERT without ANALYZE (ALLOWED - doesn't execute):");
+        let result = classify_query("EXPLAIN INSERT INTO users (name) VALUES ('test')");
+        println!("   {:?}\n", result);
+        assert_eq!(result, QueryClassification::ReadOnly);
+
+        println!("=== ALL SECURITY TESTS PASSED ===\n");
     }
 }
