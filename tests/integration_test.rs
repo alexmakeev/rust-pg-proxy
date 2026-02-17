@@ -500,3 +500,180 @@ async fn test_delete_blocked() {
     let db_err = err.as_db_error().expect("Expected database error");
     assert_eq!(db_err.code().code(), "25006");
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_select() {
+    // Extended protocol: parameterized query
+    // tokio-postgres uses extended protocol by default
+    if !check_test_env() {
+        return;
+    }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // This uses extended protocol (Parse/Bind/Execute)
+    let rows = client
+        .query("SELECT $1::int4 as value", &[&42i32])
+        .await
+        .expect("Parameterized SELECT should work via extended protocol");
+    assert_eq!(rows.len(), 1);
+    let value: i32 = rows[0].get(0);
+    assert_eq!(value, 42);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_insert_blocked() {
+    // Extended protocol: parameterized INSERT should still be blocked
+    if !check_test_env() {
+        return;
+    }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let result = client
+        .query("INSERT INTO nonexistent (id) VALUES ($1)", &[&1i32])
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let db_err = err.as_db_error().expect("Expected database error");
+    assert_eq!(db_err.code().code(), "25006");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_prepared_statement() {
+    // Test that prepared statements work
+    if !check_test_env() {
+        return;
+    }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Prepare a statement (Parse message)
+    let stmt = client
+        .prepare("SELECT $1::text as greeting")
+        .await
+        .expect("Prepare should work");
+
+    // Execute it multiple times (Bind/Execute)
+    let rows = client
+        .query(&stmt, &[&"hello"])
+        .await
+        .expect("Execute prepared statement should work");
+    assert_eq!(rows.len(), 1);
+    let greeting: String = rows[0].get(0);
+    assert_eq!(greeting, "hello");
+
+    let rows = client
+        .query(&stmt, &[&"world"])
+        .await
+        .expect("Execute same statement with different params");
+    assert_eq!(rows.len(), 1);
+    let greeting: String = rows[0].get(0);
+    assert_eq!(greeting, "world");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_prepared_write_blocked() {
+    // Preparing a write statement should be blocked at Parse time
+    if !check_test_env() {
+        return;
+    }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Trying to prepare an INSERT should fail
+    let result = client
+        .prepare("INSERT INTO nonexistent (id) VALUES ($1)")
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_multiple_queries() {
+    // Multiple sequential queries via extended protocol
+    if !check_test_env() {
+        return;
+    }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Multiple queries on same connection
+    let rows1 = client.query("SELECT 1 as a", &[]).await.expect("First query");
+    let rows2 = client
+        .query("SELECT 2 as b", &[])
+        .await
+        .expect("Second query");
+    let rows3 = client
+        .query(
+            "SELECT $1::int4 + $2::int4 as sum",
+            &[&3i32, &4i32],
+        )
+        .await
+        .expect("Third query with params");
+
+    assert_eq!(rows1[0].get::<_, i32>(0), 1);
+    assert_eq!(rows2[0].get::<_, i32>(0), 2);
+    assert_eq!(rows3[0].get::<_, i32>(0), 7);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_system_tables() {
+    // Query system tables (what client libraries do on startup)
+    if !check_test_env() {
+        return;
+    }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // This is similar to what postgres.js does on startup
+    let rows = client
+        .query(
+            "SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = $1",
+            &[&"int4"],
+        )
+        .await
+        .expect("System table query should work");
+    assert!(!rows.is_empty());
+}
