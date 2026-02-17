@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .wait_timeout(Some(std::time::Duration::from_secs(5)))
     .create_timeout(Some(std::time::Duration::from_secs(5)))
     .recycle_timeout(Some(std::time::Duration::from_secs(5)))
+    .runtime(deadpool_postgres::Runtime::Tokio1)
     .build()
     .map_err(|e| {
         error!("Failed to create connection pool: {}", e);

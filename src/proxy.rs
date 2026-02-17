@@ -3,7 +3,7 @@ use crate::classifier::{classify_query, should_cache, QueryClassification};
 use async_trait::async_trait;
 use futures_util::stream;
 use futures_util::sink::Sink;
-use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
+use pgwire::api::auth::{finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider, StartupHandler};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::NoopQueryParser;
@@ -346,15 +346,18 @@ pub struct ProxyStartupHandler;
 impl StartupHandler for ProxyStartupHandler {
     async fn on_startup<C>(
         &self,
-        _client: &mut C,
-        _message: PgWireFrontendMessage,
+        client: &mut C,
+        message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // Accept all connections without authentication
+        if let PgWireFrontendMessage::Startup(ref startup) = message {
+            save_startup_parameters_to_metadata(client, startup);
+            finish_authentication(client, self).await;
+        }
         Ok(())
     }
 }
