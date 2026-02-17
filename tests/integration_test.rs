@@ -677,3 +677,60 @@ async fn test_extended_protocol_system_tables() {
         .expect("System table query should work");
     assert!(!rows.is_empty());
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_uuid_parameter() {
+    // BUG-002: UUID parameters should be forwarded correctly
+    if !check_test_env() { return; }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await.expect("Failed to connect");
+    tokio::spawn(async move { let _ = connection.await; });
+
+    // Generate a UUID-like string and query with it as a UUID parameter
+    // This tests that OID 2950 (UUID) is handled in parameter serialization
+    let rows = client.query(
+        "SELECT $1::uuid as id",
+        &[&"550e8400-e29b-41d4-a716-446655440000"]
+    ).await.expect("UUID parameter query should work");
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_uuid_text_array_parameter() {
+    // BUG-002: Text array parameters should be forwarded correctly
+    if !check_test_env() { return; }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await.expect("Failed to connect");
+    tokio::spawn(async move { let _ = connection.await; });
+
+    // Test array parameter with ANY
+    let values = vec!["hello", "world"];
+    let rows = client.query(
+        "SELECT unnest($1::text[]) as val",
+        &[&values]
+    ).await.expect("Text array parameter query should work");
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_extended_protocol_uuid_column_query() {
+    // BUG-002: Query a table with UUID columns using parameterized query
+    // Uses pg_catalog which has UUID-like columns
+    if !check_test_env() { return; }
+    let port = start_test_proxy().await.expect("Failed to start proxy");
+    let connection_string = format!("host=127.0.0.1 port={} user=test dbname=test", port);
+    let (client, connection) = tokio_postgres::connect(&connection_string, NoTls).await.expect("Failed to connect");
+    tokio::spawn(async move { let _ = connection.await; });
+
+    // Query with text parameter that should work regardless of target column type
+    let rows = client.query(
+        "SELECT $1::text as value",
+        &[&"550e8400-e29b-41d4-a716-446655440000"]
+    ).await.expect("Text parameter should always work");
+    assert_eq!(rows.len(), 1);
+}

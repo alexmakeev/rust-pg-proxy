@@ -146,30 +146,39 @@ fn build_field_info_from_stmt(stmt: &tokio_postgres::Statement) -> Vec<FieldInfo
 /// Extract a single column value from a tokio-postgres Row as an Option<String>
 fn extract_row_value(row: &tokio_postgres::Row, idx: usize, type_oid: u32) -> Option<String> {
     match type_oid {
-        // String types
+        // String types (text, varchar, name, char, bpchar)
         25 | 1043 | 19 | 18 | 1042 => row.try_get::<_, Option<String>>(idx).ok().flatten(),
-        // Int types
+        // Int2 (smallint)
         21 => row
             .try_get::<_, Option<i16>>(idx)
             .ok()
             .flatten()
             .map(|v| v.to_string()),
+        // Int4 (integer)
         23 => row
             .try_get::<_, Option<i32>>(idx)
             .ok()
             .flatten()
             .map(|v| v.to_string()),
+        // Int8 (bigint)
         20 => row
             .try_get::<_, Option<i64>>(idx)
             .ok()
             .flatten()
             .map(|v| v.to_string()),
-        // Float types
+        // OID type (returned as u32)
+        26 => row
+            .try_get::<_, Option<u32>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string()),
+        // Float4 (real)
         700 => row
             .try_get::<_, Option<f32>>(idx)
             .ok()
             .flatten()
             .map(|v| v.to_string()),
+        // Float8 (double precision)
         701 => row
             .try_get::<_, Option<f64>>(idx)
             .ok()
@@ -181,7 +190,43 @@ fn extract_row_value(row: &tokio_postgres::Row, idx: usize, type_oid: u32) -> Op
             .ok()
             .flatten()
             .map(|v| v.to_string()),
-        // Fallback: try String first, then common types
+        // UUID
+        2950 => row
+            .try_get::<_, Option<uuid::Uuid>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string()),
+        // Timestamp without timezone
+        1114 => row
+            .try_get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.format("%Y-%m-%d %H:%M:%S%.6f").to_string()),
+        // Timestamp with timezone
+        1184 => row
+            .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.format("%Y-%m-%d %H:%M:%S%.6f%:z").to_string()),
+        // Date
+        1082 => row
+            .try_get::<_, Option<chrono::NaiveDate>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.format("%Y-%m-%d").to_string()),
+        // Time
+        1083 => row
+            .try_get::<_, Option<chrono::NaiveTime>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.format("%H:%M:%S%.6f").to_string()),
+        // JSON / JSONB
+        114 | 3802 => row
+            .try_get::<_, Option<serde_json::Value>>(idx)
+            .ok()
+            .flatten()
+            .map(|v| v.to_string()),
+        // Fallback: try common types in order of likelihood
         _ => {
             if let Ok(Some(v)) = row.try_get::<_, Option<String>>(idx) {
                 Some(v)
@@ -191,7 +236,18 @@ fn extract_row_value(row: &tokio_postgres::Row, idx: usize, type_oid: u32) -> Op
                 Some(v.to_string())
             } else if let Ok(Some(v)) = row.try_get::<_, Option<bool>>(idx) {
                 Some(v.to_string())
+            } else if let Ok(Some(v)) = row.try_get::<_, Option<uuid::Uuid>>(idx) {
+                Some(v.to_string())
+            } else if let Ok(Some(v)) = row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
+                Some(v.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            } else if let Ok(Some(v)) = row.try_get::<_, Option<serde_json::Value>>(idx) {
+                Some(v.to_string())
             } else {
+                tracing::warn!(
+                    "Could not extract value for column {} with type OID {}",
+                    idx,
+                    type_oid
+                );
                 None
             }
         }
@@ -227,8 +283,8 @@ fn encode_upstream_rows(
             let value_str = extract_row_value(row, i, col.type_oid);
 
             match &value_str {
-                Some(v) => encoder.encode_field(&Some(v.as_bytes()))?,
-                None => encoder.encode_field(&None::<&[u8]>)?,
+                Some(v) => encoder.encode_field(&Some(v.as_str()))?,
+                None => encoder.encode_field(&None::<&str>)?,
             }
 
             if let Some(ref mut strings) = row_strings {
@@ -243,6 +299,54 @@ fn encode_upstream_rows(
     }
 
     Ok((result_rows, cached_rows))
+}
+
+/// Parse a PostgreSQL text array literal like {foo,bar,baz} into Vec<String>
+fn parse_pg_text_array(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed == "{}" || trimmed.is_empty() {
+        return Vec::new();
+    }
+    // Strip outer braces
+    let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    // Simple split by comma — handles unquoted values
+    // For quoted values with commas, a more complex parser would be needed
+    inner
+        .split(',')
+        .map(|s| {
+            let s = s.trim();
+            // Strip quotes if present
+            if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+                s[1..s.len() - 1].to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Parse a PostgreSQL UUID array literal like {uuid1,uuid2} into Vec<uuid::Uuid>
+fn parse_pg_uuid_array(text: &str) -> Vec<uuid::Uuid> {
+    let trimmed = text.trim();
+    if trimmed == "{}" || trimmed.is_empty() {
+        return Vec::new();
+    }
+    let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    inner
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim().trim_matches('"');
+            s.parse::<uuid::Uuid>().ok()
+        })
+        .collect()
 }
 
 /// Build typed parameter values from portal raw bytes for upstream query execution.
@@ -305,6 +409,19 @@ fn build_typed_params(
                         let val =
                             text == "t" || text == "true" || text == "1" || text == "TRUE";
                         params.push(Box::new(val));
+                    } else if pt == &tokio_postgres::types::Type::UUID {
+                        if let Ok(val) = text.parse::<uuid::Uuid>() {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse UUID parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    } else if pt == &tokio_postgres::types::Type::TEXT_ARRAY {
+                        let arr = parse_pg_text_array(&text);
+                        params.push(Box::new(arr));
+                    } else if pt == &tokio_postgres::types::Type::UUID_ARRAY {
+                        let arr = parse_pg_uuid_array(&text);
+                        params.push(Box::new(arr));
                     } else {
                         // Default: pass as string, PostgreSQL will coerce
                         params.push(Box::new(text));
@@ -446,8 +563,8 @@ impl ReadOnlyProxy {
             let mut encoder = DataRowEncoder::new(Arc::new(fields.clone()));
             for value in row {
                 match value {
-                    Some(v) => encoder.encode_field(&Some(v.as_bytes()))?,
-                    None => encoder.encode_field(&None::<&[u8]>)?,
+                    Some(v) => encoder.encode_field(&Some(v.as_str()))?,
+                    None => encoder.encode_field(&None::<&str>)?,
                 }
             }
             results.push(encoder.finish());

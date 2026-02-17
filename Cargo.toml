@@ -8,7 +8,7 @@ pgwire = "0.25"
 sqlparser = { version = "0.59", features = ["visitor"] }
 moka = { version = "0.12", features = ["future"] }
 tokio = { version = "1", features = ["full"] }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
 twox-hash = "2.0"
 dotenvy = "0.15"
@@ -17,3 +17,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 async-trait = "0.1"
 futures-util = { version = "0.3.32", features = ["sink"] }
+uuid = { version = "1.21.0", features = ["v4"] }
+chrono = "0.4.43"
+serde_json = "1.0.149"

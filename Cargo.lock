@@ -1010,6 +1010,7 @@ dependencies = [
  "postgres-protocol",
  "serde_core",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -1281,17 +1282,20 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "chrono",
  "deadpool-postgres",
  "dotenvy",
  "futures-util",
  "moka",
  "pgwire",
+ "serde_json",
  "sqlparser",
  "tokio",
  "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "twox-hash",
+ "uuid",
 ]
 
 [[package]]
