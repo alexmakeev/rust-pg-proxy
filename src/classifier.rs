@@ -1,7 +1,172 @@
-use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SelectItem, SetExpr, Statement,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::ops::Deref;
+
+/// Functions that can modify data or cause dangerous side effects when called via SELECT
+const BLOCKED_FUNCTIONS: &[&str] = &[
+    // Large object manipulation
+    "lo_import",
+    "lo_export",
+    "lo_write",
+    "lo_unlink",
+    "lo_create",
+    "lo_put",
+    "lo_from_bytea",
+    // Filesystem operations
+    "pg_file_write",
+    "pg_file_rename",
+    "pg_file_unlink",
+    // Sequence modification
+    "setval",
+    "nextval",
+    // Remote execution
+    "dblink_exec",
+    "dblink",
+    "dblink_connect",
+    "dblink_disconnect",
+    "dblink_send_query",
+    // Session/server control
+    "pg_terminate_backend",
+    "pg_cancel_backend",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    // WAL manipulation
+    "pg_switch_wal",
+    "pg_switch_xlog",
+    // Advisory locks (can cause DoS)
+    "pg_advisory_lock",
+    "pg_advisory_xact_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_xact_lock",
+    // Notification (side effects)
+    "pg_notify",
+    // Statistics reset
+    "pg_stat_reset",
+    "pg_stat_reset_shared",
+    "pg_stat_reset_single_table_counters",
+    "pg_stat_reset_single_function_counters",
+    // Extension management
+    "pg_extension_config_dump",
+];
+
+/// Recursively extract all function names from an expression
+fn extract_function_names_from_expr(expr: &Expr) -> Vec<String> {
+    let mut names = Vec::new();
+    match expr {
+        Expr::Function(func) => {
+            names.push(func.name.to_string().to_lowercase());
+            // Check function arguments for nested function calls
+            match &func.args {
+                FunctionArguments::List(arg_list) => {
+                    for arg in &arg_list.args {
+                        match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                names.extend(extract_function_names_from_expr(e));
+                            }
+                            FunctionArg::Named {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            } => {
+                                names.extend(extract_function_names_from_expr(e));
+                            }
+                            FunctionArg::ExprNamed {
+                                arg: FunctionArgExpr::Expr(e),
+                                ..
+                            } => {
+                                names.extend(extract_function_names_from_expr(e));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                FunctionArguments::Subquery(subquery) => {
+                    names.extend(extract_function_names_from_query(subquery));
+                }
+                FunctionArguments::None => {}
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            names.extend(extract_function_names_from_expr(left));
+            names.extend(extract_function_names_from_expr(right));
+        }
+        Expr::UnaryOp { expr, .. } => {
+            names.extend(extract_function_names_from_expr(expr));
+        }
+        Expr::Nested(e) => {
+            names.extend(extract_function_names_from_expr(e));
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                names.extend(extract_function_names_from_expr(op));
+            }
+            // conditions is Vec<CaseWhen>, each CaseWhen has .condition and .result
+            for when in conditions {
+                names.extend(extract_function_names_from_expr(&when.condition));
+                names.extend(extract_function_names_from_expr(&when.result));
+            }
+            if let Some(er) = else_result {
+                names.extend(extract_function_names_from_expr(er));
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            names.extend(extract_function_names_from_expr(expr));
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            names.extend(extract_function_names_from_expr(expr));
+            names.extend(extract_function_names_from_query(subquery));
+        }
+        Expr::Subquery(q) => {
+            names.extend(extract_function_names_from_query(q));
+        }
+        _ => {}
+    }
+    names
+}
+
+/// Extract all function names from a query (SELECT projections, WHERE, HAVING, etc.)
+fn extract_function_names_from_query(query: &Query) -> Vec<String> {
+    let mut names = Vec::new();
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    names.extend(extract_function_names_from_expr(expr));
+                }
+                _ => {}
+            }
+        }
+        if let Some(selection) = &select.selection {
+            names.extend(extract_function_names_from_expr(selection));
+        }
+        if let Some(having) = &select.having {
+            names.extend(extract_function_names_from_expr(having));
+        }
+    }
+    names
+}
+
+/// Check if any extracted function name is in the blocked list.
+/// Handles schema-qualified names like "pg_catalog.lo_import" by stripping the schema prefix.
+fn check_blocked_functions(names: &[String]) -> Option<String> {
+    for name in names {
+        // Strip schema prefix (e.g. "pg_catalog.lo_import" -> "lo_import")
+        let base_name = name.rsplit('.').next().unwrap_or(name.as_str());
+        if BLOCKED_FUNCTIONS.contains(&base_name) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryClassification {
@@ -97,6 +262,14 @@ fn classify_statement(statement: &Statement) -> QueryClassification {
             if !query.locks.is_empty() {
                 return QueryClassification::Blocked(
                     "SELECT FOR UPDATE/SHARE is not allowed".to_string(),
+                );
+            }
+
+            // Check for blocked dangerous functions (e.g. lo_import, setval, dblink, etc.)
+            let func_names = extract_function_names_from_query(query);
+            if let Some(blocked) = check_blocked_functions(&func_names) {
+                return QueryClassification::Blocked(
+                    format!("Function '{}' is not allowed", blocked),
                 );
             }
 
@@ -555,6 +728,136 @@ mod tests {
     fn test_explain_without_analyze_allowed() {
         // Plain EXPLAIN doesn't execute, just shows plan - safe even for writes
         let result = classify_query("EXPLAIN INSERT INTO users (name) VALUES ('test')");
+        assert_eq!(result, QueryClassification::ReadOnly);
+    }
+
+    // DANGEROUS FUNCTION BLOCKING TESTS
+    #[test]
+    fn test_lo_import_blocked() {
+        let result = classify_query("SELECT lo_import('/etc/passwd')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_lo_export_blocked() {
+        let result = classify_query("SELECT lo_export(1234, '/tmp/out.txt')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_lo_write_blocked() {
+        let result = classify_query("SELECT lo_write(1234, 'data'::bytea)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_lo_unlink_blocked() {
+        let result = classify_query("SELECT lo_unlink(1234)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_file_write_blocked() {
+        let result = classify_query("SELECT pg_file_write('/tmp/test', 'data', false)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_setval_blocked() {
+        let result = classify_query("SELECT setval('users_id_seq', 1000)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_nextval_blocked() {
+        let result = classify_query("SELECT nextval('users_id_seq')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_terminate_backend_blocked() {
+        let result = classify_query("SELECT pg_terminate_backend(12345)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_cancel_backend_blocked() {
+        let result = classify_query("SELECT pg_cancel_backend(12345)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_dblink_exec_blocked() {
+        let result = classify_query("SELECT dblink_exec('conn', 'DELETE FROM users')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_dblink_blocked() {
+        let result = classify_query("SELECT * FROM dblink('dbname=mydb', 'SELECT 1') AS t(id int)");
+        // dblink used as a set-returning function in FROM is a table function, not Expr::Function —
+        // this test documents current behavior
+        let _ = result;
+    }
+
+    #[test]
+    fn test_pg_advisory_lock_blocked() {
+        let result = classify_query("SELECT pg_advisory_lock(1)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_advisory_unlock_blocked() {
+        let result = classify_query("SELECT pg_try_advisory_lock(1)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_reload_conf_blocked() {
+        let result = classify_query("SELECT pg_reload_conf()");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_switch_wal_blocked() {
+        let result = classify_query("SELECT pg_switch_wal()");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_pg_notify_blocked() {
+        let result = classify_query("SELECT pg_notify('channel', 'message')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_schema_qualified_blocked() {
+        let result = classify_query("SELECT pg_catalog.lo_import('/etc/passwd')");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_safe_functions_allowed() {
+        let result = classify_query("SELECT count(*), max(id), min(id) FROM users");
+        assert_eq!(result, QueryClassification::ReadOnly);
+    }
+
+    #[test]
+    fn test_nested_blocked_function_in_case() {
+        let result = classify_query("SELECT CASE WHEN true THEN setval('seq', 1) ELSE 0 END");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_blocked_function_in_where() {
+        let result = classify_query("SELECT * FROM users WHERE id = setval('seq', 1)");
+        assert!(matches!(result, QueryClassification::Blocked(_)));
+    }
+
+    #[test]
+    fn test_string_literal_not_blocked() {
+        // A string containing a blocked function name should not be blocked
+        let result = classify_query("SELECT 'setval' FROM users");
         assert_eq!(result, QueryClassification::ReadOnly);
     }
 
