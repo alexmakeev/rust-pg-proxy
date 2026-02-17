@@ -1288,6 +1288,7 @@ dependencies = [
  "futures-util",
  "moka",
  "pgwire",
+ "rust_decimal",
  "serde_json",
  "sqlparser",
  "tokio",

@@ -349,6 +349,29 @@ fn parse_pg_uuid_array(text: &str) -> Vec<uuid::Uuid> {
         .collect()
 }
 
+/// Parse a PostgreSQL array literal into Vec<T> using a conversion function
+fn parse_pg_typed_array<T, F>(text: &str, convert: F) -> Vec<T>
+where
+    F: Fn(&str) -> Option<T>,
+{
+    let trimmed = text.trim();
+    if trimmed == "{}" || trimmed.is_empty() {
+        return Vec::new();
+    }
+    let inner = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    inner
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim().trim_matches('"');
+            convert(s)
+        })
+        .collect()
+}
+
 /// Build typed parameter values from portal raw bytes for upstream query execution.
 ///
 /// Extended protocol clients send parameters as raw bytes. For text-format parameters
@@ -421,6 +444,101 @@ fn build_typed_params(
                         params.push(Box::new(arr));
                     } else if pt == &tokio_postgres::types::Type::UUID_ARRAY {
                         let arr = parse_pg_uuid_array(&text);
+                        params.push(Box::new(arr));
+                    // --- Temporal types (chrono) ---
+                    } else if pt == &tokio_postgres::types::Type::TIMESTAMP {
+                        if let Ok(val) = chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f") {
+                            params.push(Box::new(val));
+                        } else if let Ok(val) = chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.f") {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse TIMESTAMP parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    } else if pt == &tokio_postgres::types::Type::TIMESTAMPTZ {
+                        if let Ok(val) = chrono::DateTime::parse_from_rfc3339(&text) {
+                            params.push(Box::new(val.with_timezone(&chrono::Utc)));
+                        } else if let Ok(val) = chrono::DateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f%:z") {
+                            params.push(Box::new(val.with_timezone(&chrono::Utc)));
+                        } else if let Ok(val) = chrono::DateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f%z") {
+                            params.push(Box::new(val.with_timezone(&chrono::Utc)));
+                        } else {
+                            tracing::warn!("Failed to parse TIMESTAMPTZ parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    } else if pt == &tokio_postgres::types::Type::DATE {
+                        if let Ok(val) = chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse DATE parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    } else if pt == &tokio_postgres::types::Type::TIME {
+                        if let Ok(val) = chrono::NaiveTime::parse_from_str(&text, "%H:%M:%S%.f") {
+                            params.push(Box::new(val));
+                        } else if let Ok(val) = chrono::NaiveTime::parse_from_str(&text, "%H:%M:%S") {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse TIME parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    // --- JSON types ---
+                    } else if pt == &tokio_postgres::types::Type::JSON || pt == &tokio_postgres::types::Type::JSONB {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse JSON parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    // --- NUMERIC ---
+                    } else if pt == &tokio_postgres::types::Type::NUMERIC {
+                        if let Ok(val) = text.parse::<rust_decimal::Decimal>() {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse NUMERIC parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    // --- BYTEA ---
+                    } else if pt == &tokio_postgres::types::Type::BYTEA {
+                        // Extended protocol sends bytea as raw bytes
+                        let bytes = text.into_bytes();
+                        params.push(Box::new(bytes));
+                    // --- OID ---
+                    } else if pt == &tokio_postgres::types::Type::OID {
+                        if let Ok(val) = text.parse::<u32>() {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse OID parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    // --- INET ---
+                    } else if pt == &tokio_postgres::types::Type::INET {
+                        if let Ok(val) = text.parse::<std::net::IpAddr>() {
+                            params.push(Box::new(val));
+                        } else {
+                            tracing::warn!("Failed to parse INET parameter: {}", text);
+                            params.push(Box::new(text));
+                        }
+                    // --- Numeric arrays ---
+                    } else if pt == &tokio_postgres::types::Type::INT4_ARRAY {
+                        let arr = parse_pg_typed_array(&text, |s| s.parse::<i32>().ok());
+                        params.push(Box::new(arr));
+                    } else if pt == &tokio_postgres::types::Type::INT8_ARRAY {
+                        let arr = parse_pg_typed_array(&text, |s| s.parse::<i64>().ok());
+                        params.push(Box::new(arr));
+                    } else if pt == &tokio_postgres::types::Type::FLOAT8_ARRAY {
+                        let arr = parse_pg_typed_array(&text, |s| s.parse::<f64>().ok());
+                        params.push(Box::new(arr));
+                    } else if pt == &tokio_postgres::types::Type::BOOL_ARRAY {
+                        let arr = parse_pg_typed_array(&text, |s| {
+                            Some(s == "t" || s == "true" || s == "1" || s == "TRUE")
+                        });
+                        params.push(Box::new(arr));
+                    } else if pt == &tokio_postgres::types::Type::FLOAT4_ARRAY {
+                        let arr = parse_pg_typed_array(&text, |s| s.parse::<f32>().ok());
+                        params.push(Box::new(arr));
+                    } else if pt == &tokio_postgres::types::Type::INT2_ARRAY {
+                        let arr = parse_pg_typed_array(&text, |s| s.parse::<i16>().ok());
                         params.push(Box::new(arr));
                     } else {
                         // Default: pass as string, PostgreSQL will coerce
